@@ -32,6 +32,8 @@ struct Args {
     full_graph: bool,
     #[arg(long, short, action, help = "Show list of all unique dependencies.")]
     unique_list: bool,
+    #[arg(long, short, action, help = "Show Opam packages.")]
+    opam: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -56,7 +58,9 @@ struct AnalysisResult {
     targets: Vec<TargetInfo>,
     dependency_graphs: HashMap<String, DependencyNode>,
     all_unique_dependencies: Vec<String>,
-    external_dependencies: Vec<String>,
+    external_dependencies: Vec<String>, // Missing dependencies
+    opam_dependencies: Vec<String>, // OPAM packages actually used
+    unused_opam_dependencies: Vec<String>, // OPAM packages installed but not used
 }
 
 struct DependencyAnalyzer {
@@ -66,15 +70,18 @@ struct DependencyAnalyzer {
     visited_libs: HashSet<String>,
     expanded_libs: HashSet<String>, // Track which libraries have been fully expanded in output
     all_dependencies: HashSet<String>, // Collect all unique dependencies
-    external_dependencies: HashSet<String>, // Collect all external/opam/missing dependencies
+    external_dependencies: HashSet<String>, // Collect all missing dependencies
+    installed_opam_packages: HashSet<String>, // All installed OPAM packages from opam.export
+    used_opam_packages: HashSet<String>, // OPAM packages actually used in the dependency graph
     library_index: HashMap<String, PathBuf>, // Map of library name -> dune file path
     executable_targets: Vec<TargetInfo>, // All executable targets found during walk
 }
 
 impl DependencyAnalyzer {
-    fn new(root_dir: PathBuf) -> Self {
+    fn new(root_dir: PathBuf) -> Result<Self> {
         let src_dir = root_dir.join("src");
-        Self {
+        let installed_opam_packages = Self::load_opam_export(&root_dir)?;
+        Ok(Self {
             root_dir,
             src_dir,
             dependency_cache: HashMap::new(),
@@ -82,16 +89,72 @@ impl DependencyAnalyzer {
             expanded_libs: HashSet::new(),
             all_dependencies: HashSet::new(),
             external_dependencies: HashSet::new(),
+            installed_opam_packages,
+            used_opam_packages: HashSet::new(),
             library_index: HashMap::new(),
             executable_targets: Vec::new(),
+        })
+    }
+
+    fn load_opam_export(root_dir: &PathBuf) -> Result<HashSet<String>> {
+        let opam_export_path = root_dir.join("opam.export");
+        if !opam_export_path.exists() {
+            eprintln!("Warning: opam.export not found, OPAM package detection will be limited");
+            return Ok(HashSet::new());
         }
+
+        let content = std::fs::read_to_string(&opam_export_path)
+            .with_context(|| format!("Failed to read {}", opam_export_path.display()))?;
+
+        let mut installed = HashSet::new();
+        let mut in_installed_section = false;
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line == "installed: [" {
+                in_installed_section = true;
+                continue;
+            }
+            if in_installed_section {
+                if line == "]" {
+                    break;
+                }
+                // Parse lines like: "  \"package-name.version\""
+                if let Some(start) = line.find('"') {
+                    if let Some(end) = line[start + 1..].find('"') {
+                        let package_with_version = &line[start + 1..start + 1 + end];
+                        // Extract package name (before the first dot or version separator)
+                        let package_name = if let Some(dot_pos) = package_with_version.find('.') {
+                            // Check if it's a version separator (like "base.v0.14.3" or "async.v0.14.0")
+                            // or a sub-package separator (like "base-bigarray.base")
+                            let before_dot = &package_with_version[..dot_pos];
+                            let after_dot = &package_with_version[dot_pos + 1..];
+
+                            // If after dot starts with 'v' or a digit, it's a version
+                            if after_dot.starts_with('v') || after_dot.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                                before_dot.to_string()
+                            } else {
+                                // It's a sub-package, use the full name
+                                package_with_version.to_string()
+                            }
+                        } else {
+                            package_with_version.to_string()
+                        };
+                        installed.insert(package_name);
+                    }
+                }
+            }
+        }
+
+        eprintln!("Loaded {} installed OPAM packages from opam.export", installed.len());
+        Ok(installed)
     }
 
     fn build_library_index(&mut self) -> Result<()> {
         eprintln!("Building library index from src/ tree...");
         let src_dir = self.src_dir.clone();
         self.walk_and_index_dune_files(&src_dir)?;
-        
+
         // Also check root dune and dune-project files
         let root_dune = self.root_dir.join("dune");
         if root_dune.exists() {
@@ -102,7 +165,7 @@ impl DependencyAnalyzer {
                 }
             }
         }
-        
+
         let root_dune_project = self.root_dir.join("dune-project");
         if root_dune_project.exists() {
             if let Ok(sexps) = self.parse_dune_file(&root_dune_project) {
@@ -112,7 +175,7 @@ impl DependencyAnalyzer {
                 }
             }
         }
-        
+
         eprintln!("Indexed {} libraries", self.library_index.len());
         eprintln!("Found {} executable targets", self.executable_targets.len());
         Ok(())
@@ -305,7 +368,7 @@ impl DependencyAnalyzer {
         // A single dune file can have more than one s-expr (like when src/app/foo builds 3 exe's)
         // Wrapping the content in a list allows us to extract each item.
         let wrapped = format!("({})", content.trim());
-        
+
         match sexp::parse(&wrapped) {
             Ok(Sexp::List(items)) => {
                 // this is now pretty much the only code path
@@ -424,6 +487,16 @@ impl DependencyAnalyzer {
     }
 
     fn is_opam_package(&self, lib_name: &str) -> bool {
+        // First, check if it's a known opam package.
+        if self.installed_opam_packages.contains(lib_name) {
+            return true;
+        }
+        // Also check for sub-packages (e.g., "base.caml" when "base" is installed)
+        if let Some((base, _)) = lib_name.split_once('.') {
+            if self.installed_opam_packages.contains(base) {
+                return true;
+            }
+        }
         // If we can't find a dune file for this library in the project, it's most likely an external/opam package
         // but track it, because this could also indicate a missing dependency, part of the final
         // output.
@@ -440,7 +513,6 @@ impl DependencyAnalyzer {
     ) -> Option<DependencyNode> {
         // First, check for cycles - If we're currently already processing the lib, we have
         // cyclical dependencies (which is valid, but we need to break out to avoid deadlocks).
-        //
         // This must be checked before expanded_libs to catch cycles even if the library
         // was previously expanded in a different branch of the tree
         if processing.contains(lib_name) {
@@ -454,11 +526,18 @@ impl DependencyAnalyzer {
 
         // Track this as a dependency
         self.all_dependencies.insert(lib_name.to_string());
-        
-        // Check if it's external/opam and track it
-        // This is to report missing deps mostly - opam deps are noise, we can probably
-        // filter common ones out, or look for opam files.
-        if self.is_opam_package(lib_name) {
+
+        // Check if it's opam and track it
+        if self.installed_opam_packages.contains(lib_name) {
+            self.used_opam_packages.insert(lib_name.to_string());
+        } else if let Some((base, _)) = lib_name.split_once('.') {
+            if self.installed_opam_packages.contains(base) {
+                self.used_opam_packages.insert(base.to_string());
+            }
+        }
+        // Track as a missing dependency if it's not an installed opam package
+        // // and it can't be found as a dune lib.
+        if !self.is_opam_package(lib_name) && self.find_library_dune(lib_name).is_none() {
             self.external_dependencies.insert(lib_name.to_string());
         }
 
@@ -529,7 +608,7 @@ impl DependencyAnalyzer {
                 self.visited_libs.insert(lib_name.to_string());
                 return Some(DependencyNode {
                     name: lib_name.to_string(),
-                    node_type: "library (external)".to_string(),
+                    node_type: "library (external - missing)".to_string(),
                     path: "external".to_string(),
                     dependencies: vec![],
                 });
@@ -608,8 +687,14 @@ impl DependencyAnalyzer {
 
         let mut child_deps = Vec::new();
         for dep in all_deps {
-            // Don't list opam/missing ones.
+            // add opam packages to the list.
             if self.is_opam_package(&dep) {
+                child_deps.push(DependencyNode{
+                    name: dep,
+                    node_type: "opam".to_string(),
+                    path: "opam".to_string(),
+                    dependencies: vec![],
+                });
                 continue;
             }
 
@@ -660,20 +745,37 @@ impl DependencyAnalyzer {
         }
 
         let mut dependencies = Vec::new();
-        
+
         // If level is 0, don't show any dependencies - just the target itself
         if let Some(0) = max_level {
-            // Still track external dependencies even at level 0
+            // Still track opam dependencies even at level 0
             for lib in all_libs {
-                if self.is_opam_package(&lib) {
+                if self.installed_opam_packages.contains(&lib) {
+                    self.used_opam_packages.insert(lib.clone());
+                } else if let Some((base, _)) = lib.split_once('.') {
+                    if self.installed_opam_packages.contains(base) {
+                        self.used_opam_packages.insert(base.to_string());
+                    }
+                } else if !self.find_library_dune(&lib).is_some() {
                     self.external_dependencies.insert(lib.clone());
                 }
             }
         } else {
             let mut processing = HashSet::new();
             for lib in all_libs {
-                // Track external dependencies even if we skip them
-                if self.is_opam_package(&lib) {
+                // Track opam dependencies even if we skip them
+                if self.installed_opam_packages.contains(&lib) {
+                    self.used_opam_packages.insert(lib.clone());
+                    continue;
+                } else if let Some((base, _)) = lib.split_once('.') {
+                    if self.installed_opam_packages.contains(base) {
+                        self.used_opam_packages.insert(base.to_string());
+                        continue;
+                    }
+                }
+
+                // Track missing deps
+                if !self.find_library_dune(&lib).is_some() {
                     self.external_dependencies.insert(lib.clone());
                     continue;
                 }
@@ -708,7 +810,7 @@ impl DependencyAnalyzer {
                 eprintln!("Filtered to target: {filter}");
             }
         }
-        
+
         eprintln!("Found {} executable targets", targets.len());
 
         if let Some(level) = max_level {
@@ -737,11 +839,24 @@ impl DependencyAnalyzer {
         let mut external_deps: Vec<String> = self.external_dependencies.iter().cloned().collect();
         external_deps.sort();
 
+        // Convert used_opam_packages to sorted vector
+        let mut used_opam: Vec<String> = self.used_opam_packages.iter().cloned().collect();
+        used_opam.sort();
+
+        // Compute unused OPAM packages (installed but not used)
+        let mut unused_opam: Vec<String> = self.installed_opam_packages
+            .difference(&self.used_opam_packages)
+            .cloned()
+            .collect();
+        unused_opam.sort();
+
         Ok(AnalysisResult {
             targets,
             dependency_graphs,
             all_unique_dependencies: all_unique_deps,
             external_dependencies: external_deps,
+            opam_dependencies: used_opam,
+            unused_opam_dependencies: unused_opam,
         })
     }
 }
@@ -750,7 +865,7 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     let root = args.root.canonicalize()?;
-    let mut analyzer = DependencyAnalyzer::new(root);
+    let mut analyzer = DependencyAnalyzer::new(root)?;
 
     let result = analyzer.analyze(args.target.as_deref(), args.pattern, args.level)?;
 
@@ -799,12 +914,32 @@ fn output_text(result: &AnalysisResult, args: Args) {
     }
 
     println!("\n{}", "=".repeat(80));
-    println!("OPAM OR MISSING");
+    println!("MISSING");
     println!("{}", "=".repeat(80));
     println!("Total: {}", result.external_dependencies.len());
     println!("These dependencies were not found in the project and are assumed to be opam packages.");
     println!("Please verify they are opam dependencies, or add them to the project if missing:");
     for dep in &result.external_dependencies {
+        println!("  - {dep}");
+    }
+
+    if args.opam {
+        println!("\n{}", "=".repeat(80));
+        println!("OPAM DEPENDENCIES (USED)");
+        println!("{}", "=".repeat(80));
+        println!("Total: {}", result.opam_dependencies.len());
+        println!("These OPAM packages are installed and actually used in the dependency graph:");
+        for dep in &result.opam_dependencies {
+            println!("  - {dep}");
+        }
+    }
+
+    println!("\n{}", "=".repeat(80));
+    println!("UNUSED OPAM DEPENDENCIES");
+    println!("{}", "=".repeat(80));
+    println!("Total: {}", result.unused_opam_dependencies.len());
+    println!("These OPAM packages are installed but not used in the dependency graph:");
+    for dep in &result.unused_opam_dependencies {
         println!("  - {dep}");
     }
 }

@@ -3,25 +3,32 @@
 While working on a sizeable OCaml mono-repo, I was struggling to get a clear picture of which dependencies were used where, and how. I wanted a simple dependency graph.
 I'm sure that there is some way to use `dune describe` to get something actually usable, but I couldn't quite get what I was after, so instead I decided to build my own tool. 
 
+This tool:
+
+* Prints a list of all dependencies used
+* finds unused opam packages
+* Shows missing libs (not opam, not present in src/lib or dune)
+* Prints a dependency graph showing direct and indirect dependencies.
 
 ## Usage
 
 ```sh
 $ dune-graph -h
+
 Analyze build targets and dependencies from dune files
 
 Usage: dune-graph [OPTIONS]
 
 Options:
-      --format <FORMAT>  [default: text]
-      --root <ROOT>      [default: .]
-      --level <LEVEL>    Maximum depth level to resolve dependencies (e.g., --level 2)
+      --format <FORMAT>  For now only text is supported [default: text]
+      --root <ROOT>      Expected to be a repo root, with a src directory [default: .]
+      --level <LEVEL>    Maximum depth level to resolve dependencies - set to 0 to list all build targets (no dependency graph)
       --target <TARGET>  Focus on a specific target (e.g., --target foobar)
   -p, --pattern          Use pattern matching for --target (matches substring like foo)
   -f, --full-graph       Include fully resolved dependency graph
   -u, --unique-list      Show list of all unique dependencies.
+  -o, --opam             Show Opam packages.
   -h, --help             Print help
-
 ```
 
 To list all build targets in the project root, simply run
@@ -61,4 +68,10 @@ Same as above, but with a dependency graph:
 
 ```sh
 $ dune-graph -f -u
+```
+
+Full output, including opam deps:
+
+```sh
+$ dune-graph -p -u -f
 ```
