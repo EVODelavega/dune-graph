@@ -74,7 +74,7 @@ struct DependencyAnalyzer {
     expanded_libs: HashSet<String>, // Track which libraries have been fully expanded in output
     all_dependencies: HashSet<String>, // Collect all unique dependencies
     external_dependencies: HashSet<String>, // Collect all missing dependencies
-    installed_opam_packages: HashSet<String>, // All installed OPAM packages from opam.export
+    installed_opam_packages: HashMap<String, String>, // All installed OPAM packages from opam.export (name -> version)
     used_opam_packages: HashSet<String>, // OPAM packages actually used in the dependency graph
     library_index: HashMap<String, PathBuf>, // Map of library name -> dune file path
     executable_targets: Vec<TargetInfo>, // All executable targets found during walk
@@ -99,17 +99,17 @@ impl DependencyAnalyzer {
         })
     }
 
-    fn load_opam_export(root_dir: &Path) -> Result<HashSet<String>> {
+    fn load_opam_export(root_dir: &Path) -> Result<HashMap<String, String>> {
         let opam_export_path = root_dir.join("opam.export");
         if !opam_export_path.exists() {
             eprintln!("Warning: opam.export not found, OPAM package detection will be limited");
-            return Ok(HashSet::new());
+            return Ok(HashMap::new());
         }
 
         let content = std::fs::read_to_string(&opam_export_path)
             .with_context(|| format!("Failed to read {}", opam_export_path.display()))?;
 
-        let mut installed = HashSet::new();
+        let mut installed = HashMap::new();
         let mut in_installed_section = false;
 
         for line in content.lines() {
@@ -122,28 +122,28 @@ impl DependencyAnalyzer {
                 if line == "]" {
                     break;
                 }
-                // Parse lines like: "  \"package-name.version\""
+                // Parse lines: '  "package-name.version"'
                 if let Some(start) = line.find('"') {
                     if let Some(end) = line[start + 1..].find('"') {
                         let package_with_version = &line[start + 1..start + 1 + end];
-                        // Extract package name (before the first dot or version separator)
-                        let package_name = if let Some(dot_pos) = package_with_version.find('.') {
-                            // Check if it's a version separator (like "base.v0.14.3" or "async.v0.14.0")
+                        // Extract package name (ie look for dot denoting version)
+                        let (package_name, version) = if let Some(dot_pos) = package_with_version.find('.') {
+                            // Check if it's a version separator (like "foo.v0.14.3" or "bar.v0.14.0")
                             // or a sub-package separator (like "base-bigarray.base")
                             let before_dot = &package_with_version[..dot_pos];
                             let after_dot = &package_with_version[dot_pos + 1..];
 
-                            // If after dot starts with 'v' or a digit, it's a version
+                            // If after dot we see a 'v' or a digit, it's by definition a version.
                             if after_dot.starts_with('v') || after_dot.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                                before_dot.to_string()
+                                (before_dot.to_string(), after_dot.to_string())
                             } else {
-                                // It's a sub-package, use the full name
-                                package_with_version.to_string()
+                                // It's a sub-package, use the full name with no separate version
+                                (package_with_version.to_string(), String::new())
                             }
                         } else {
-                            package_with_version.to_string()
+                            (package_with_version.to_string(), String::new())
                         };
-                        installed.insert(package_name);
+                        installed.insert(package_name, version);
                     }
                 }
             }
@@ -158,7 +158,7 @@ impl DependencyAnalyzer {
         let src_dir = self.src_dir.clone();
         self.walk_and_index_dune_files(&src_dir)?;
 
-        // Also check root dune and dune-project files
+        // include root dune and dune-project files
         let root_dune = self.root_dir.join("dune");
         if root_dune.exists() {
             if let Ok(sexps) = self.parse_dune_file(&root_dune) {
@@ -205,7 +205,7 @@ impl DependencyAnalyzer {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    // Skip .git and other hidden directories
+                    // Skip hidden directories
                     if let Some(name) = path.file_name() {
                         let name_str = name.to_string_lossy();
                         if name_str.starts_with('.') {
@@ -224,7 +224,7 @@ impl DependencyAnalyzer {
         if let Sexp::List(list) = sexp {
             if let Some(Sexp::Atom(Atom::S(s))) = list.first() {
                 if s == "library" {
-                    // Extract names
+                    // extract names
                     let mut name: Option<String> = None;
                     let mut public_name: Option<String> = None;
 
@@ -491,12 +491,12 @@ impl DependencyAnalyzer {
 
     fn is_opam_package(&self, lib_name: &str) -> bool {
         // First, check if it's a known opam package.
-        if self.installed_opam_packages.contains(lib_name) {
+        if self.installed_opam_packages.contains_key(lib_name) {
             return true;
         }
         // Also check for sub-packages (e.g., "base.caml" when "base" is installed)
         if let Some((base, _)) = lib_name.split_once('.') {
-            if self.installed_opam_packages.contains(base) {
+            if self.installed_opam_packages.contains_key(base) {
                 return true;
             }
         }
@@ -531,10 +531,10 @@ impl DependencyAnalyzer {
         self.all_dependencies.insert(lib_name.to_string());
 
         // Check if it's opam and track it
-        if self.installed_opam_packages.contains(lib_name) {
+        if self.installed_opam_packages.contains_key(lib_name) {
             self.used_opam_packages.insert(lib_name.to_string());
         } else if let Some((base, _)) = lib_name.split_once('.') {
-            if self.installed_opam_packages.contains(base) {
+            if self.installed_opam_packages.contains_key(base) {
                 self.used_opam_packages.insert(base.to_string());
             }
         }
@@ -753,10 +753,10 @@ impl DependencyAnalyzer {
         if let Some(0) = max_level {
             // Still track opam dependencies even at level 0
             for lib in all_libs {
-                if self.installed_opam_packages.contains(&lib) {
+                if self.installed_opam_packages.contains_key(&lib) {
                     self.used_opam_packages.insert(lib.clone());
                 } else if let Some((base, _)) = lib.split_once('.') {
-                    if self.installed_opam_packages.contains(base) {
+                    if self.installed_opam_packages.contains_key(base) {
                         self.used_opam_packages.insert(base.to_string());
                     }
                 } else if self.find_library_dune(&lib).is_none() {
@@ -767,11 +767,11 @@ impl DependencyAnalyzer {
             let mut processing = HashSet::new();
             for lib in all_libs {
                 // Track opam dependencies even if we skip them
-                if self.installed_opam_packages.contains(&lib) {
+                if self.installed_opam_packages.contains_key(&lib) {
                     self.used_opam_packages.insert(lib.clone());
                     continue;
                 } else if let Some((base, _)) = lib.split_once('.') {
-                    if self.installed_opam_packages.contains(base) {
+                    if self.installed_opam_packages.contains_key(base) {
                         self.used_opam_packages.insert(base.to_string());
                         continue;
                     }
@@ -842,14 +842,18 @@ impl DependencyAnalyzer {
         let mut external_deps: Vec<String> = self.external_dependencies.iter().cloned().collect();
         external_deps.sort();
 
-        // Convert used_opam_packages to sorted vector
-        let mut used_opam: Vec<String> = self.used_opam_packages.iter().cloned().collect();
+        // Convert used_opam_packages to sorted vector, annotated with version
+        let mut used_opam: Vec<String> = self.used_opam_packages
+            .iter()
+            .map(|name| fmt_opam_version(name, &self.installed_opam_packages))
+            .collect();
         used_opam.sort();
 
-        // Compute unused OPAM packages (installed but not used)
+        // Compute unused OPAM packages (installed but not used), annotated with version
         let mut unused_opam: Vec<String> = self.installed_opam_packages
-            .difference(&self.used_opam_packages)
-            .cloned()
+            .keys()
+            .filter(|k| !self.used_opam_packages.contains(*k))
+            .map(|name| fmt_opam_version(name, &self.installed_opam_packages))
             .collect();
         unused_opam.sort();
 
@@ -861,6 +865,13 @@ impl DependencyAnalyzer {
             opam_dependencies: used_opam,
             unused_opam_dependencies: unused_opam,
         })
+    }
+}
+
+fn fmt_opam_version(name: &str, versions: &HashMap<String, String>) -> String {
+    match versions.get(name) {
+        Some(v) if !v.is_empty() => format!("{name} ({v})"),
+        _ => name.to_string(),
     }
 }
 
