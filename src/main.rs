@@ -12,7 +12,10 @@ use std::collections::{
     HashMap,
     HashSet,
 };
-use std::path::PathBuf;
+use std::path::{
+    PathBuf,
+    Path,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "dune-graph")]
@@ -96,7 +99,7 @@ impl DependencyAnalyzer {
         })
     }
 
-    fn load_opam_export(root_dir: &PathBuf) -> Result<HashSet<String>> {
+    fn load_opam_export(root_dir: &Path) -> Result<HashSet<String>> {
         let opam_export_path = root_dir.join("opam.export");
         if !opam_export_path.exists() {
             eprintln!("Warning: opam.export not found, OPAM package detection will be limited");
@@ -756,7 +759,7 @@ impl DependencyAnalyzer {
                     if self.installed_opam_packages.contains(base) {
                         self.used_opam_packages.insert(base.to_string());
                     }
-                } else if !self.find_library_dune(&lib).is_some() {
+                } else if self.find_library_dune(&lib).is_none() {
                     self.external_dependencies.insert(lib.clone());
                 }
             }
@@ -775,7 +778,7 @@ impl DependencyAnalyzer {
                 }
 
                 // Track missing deps
-                if !self.find_library_dune(&lib).is_some() {
+                if self.find_library_dune(&lib).is_none() {
                     self.external_dependencies.insert(lib.clone());
                     continue;
                 }
